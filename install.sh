@@ -10,6 +10,11 @@
 # command for invites and accounts.  Run it again to update or to change the
 # address: accounts and settings stay.
 #
+# The settings live in one file, /opt/dudescord/dudescord.conf: edit it and run
+# `dudescord apply`.  Nothing here asks a question; --check runs every check
+# and changes nothing.  A guide for coding agents is AGENTS.md beside this
+# script (https://github.com/tapyard/dudescord).
+#
 # It touches only /opt/dudescord, three units named dudescord*, the command
 # /usr/local/bin/dudescord, the system user "dudescord" and — when ufw or
 # firewalld is active — the firewall rules for its own ports.
@@ -22,6 +27,10 @@ set -euo pipefail
 
 RELEASES_URL="${DUDESCORD_RELEASES_URL:-https://github.com/tapyard/dudescord/releases}"
 DIR=/opt/dudescord
+# The settings file (ADR 0026).  Release 2.2.0 called it install.conf: that
+# one is read when there is no other, and replaced.
+CONF="$DIR/dudescord.conf"
+OLD_CONF="$DIR/install.conf"
 UNIT_DIR=/etc/systemd/system
 WRAPPER=/usr/local/bin/dudescord
 UDP_RANGE=40000-49999
@@ -33,6 +42,7 @@ ACME_PORT=""
 TURN_PORT=""
 EMAIL=""
 ACME_DIRECTORY=""
+CONFIG=""
 VERSION_TAG=""
 BUNDLE=""
 UNPACKED=""
@@ -49,15 +59,28 @@ die() {
   printf '\ndudescord: %s\n' "$*" >&2
   exit 1
 }
+# A wrong command line is exit status 2; everything else that fails is 1.
+die_usage() {
+  printf '\ndudescord: %s\n' "$*" >&2
+  exit 2
+}
 
 usage() {
   cat <<'USAGE'
 Dudescord server installer.
 
-  install.sh [options]              install, update, or change the address
+  install.sh [options]              install, update, or change the settings
+  install.sh --check [options]      run every check of an install, change nothing
   install.sh --uninstall [--yes] [--keep-data]
 
+The settings are kept in /opt/dudescord/dudescord.conf (ADDRESS, PORT,
+TURN_PORT, ACME_PORT, EMAIL).  After the install: edit that file and run
+`dudescord apply`.  An option below overrides the file.  Nothing asks a
+question.  Exit status: 0 done, 1 failed, 2 wrong command line.
+
 Options:
+  --config <file>          settings for this run, in the shape of that file
+                           (KEY=value lines; an option overrides the file)
   --address <ip or name>   the public address of this machine: its IPv4 address
                            or a domain name that points to it
                            (default: the public IPv4 address, detected)
@@ -71,6 +94,8 @@ Options:
   --version <tag>          install this release instead of the newest (e.g. v2.2.0)
   --bundle <file>          install from a downloaded bundle instead of the network
   --staging                use Let's Encrypt's staging CA (untrusted test certificates)
+  --check                  check the machine, the settings, the address and the
+                           ports; print what an install would do; change nothing
   --uninstall              remove the server; asks before deleting accounts
   --yes                    do not ask (with --uninstall)
   --keep-data              with --uninstall: keep accounts, settings and the certificate
@@ -119,8 +144,8 @@ valid_release() { [[ "$1" =~ ^[0-9]{14}-[0-9a-f]{7,40}(-dirty)?$ ]]; }
 parse_args() {
   while [ "$#" -gt 0 ]; do
     case "$1" in
-    --address | --port | --turn-port | --acme-port | --email | --version | --bundle | --unpacked | --acme-directory)
-      [ "$#" -ge 2 ] && [ -n "$2" ] || die "$1 needs a value (see --help)"
+    --address | --port | --turn-port | --acme-port | --email | --version | --bundle | --unpacked | --acme-directory | --config)
+      [ "$#" -ge 2 ] && [ -n "$2" ] || die_usage "$1 needs a value (see --help)"
       case "$1" in
       --address) ADDRESS="$2" ;;
       --port) PORT="$2" ;;
@@ -131,6 +156,7 @@ parse_args() {
       --bundle) BUNDLE="$2" ;;
       --unpacked) UNPACKED="$2" ;;
       --acme-directory) ACME_DIRECTORY="$2" ;;
+      --config) CONFIG="$2" ;;
       esac
       shift 2
       ;;
@@ -138,8 +164,12 @@ parse_args() {
       ACME_DIRECTORY="$LETSENCRYPT_STAGING"
       shift
       ;;
-    --uninstall)
-      MODE=uninstall
+    --uninstall | --check)
+      # one or the other, whatever the order: --check promises to change
+      # nothing, and must never end in an uninstall
+      [ "$MODE" = install ] || [ "$MODE" = "${1#--}" ] ||
+        die_usage "--check and --uninstall do not go together"
+      MODE="${1#--}"
       shift
       ;;
     --yes)
@@ -154,41 +184,148 @@ parse_args() {
       usage
       exit 0
       ;;
-    *) die "unknown option $1 (see --help)" ;;
+    *) die_usage "unknown option $1 (see --help)" ;;
     esac
   done
 
   [ -z "$ADDRESS" ] || valid_address "$ADDRESS" ||
-    die "--address must be an IPv4 address (203.0.113.5) or a domain name in lower case (chat.example.org)"
-  [ -z "$PORT" ] || valid_port "$PORT" || die "--port must be a port number"
-  [ -z "$TURN_PORT" ] || valid_port "$TURN_PORT" || die "--turn-port must be a port number"
-  [ -z "$ACME_PORT" ] || valid_port "$ACME_PORT" || die "--acme-port must be a port number"
-  [ -z "$EMAIL" ] || valid_email "$EMAIL" || die "--email does not look like an e-mail address"
-  [ -z "$VERSION_TAG" ] || valid_tag "$VERSION_TAG" || die "--version must be a release tag like v2.2.0"
-  [ -z "$ACME_DIRECTORY" ] || valid_directory "$ACME_DIRECTORY" || die "--acme-directory must be an https URL"
+    die_usage "--address must be an IPv4 address (203.0.113.5) or a domain name in lower case (chat.example.org)"
+  [ -z "$PORT" ] || valid_port "$PORT" || die_usage "--port must be a port number"
+  [ -z "$TURN_PORT" ] || valid_port "$TURN_PORT" || die_usage "--turn-port must be a port number"
+  [ -z "$ACME_PORT" ] || valid_port "$ACME_PORT" || die_usage "--acme-port must be a port number"
+  [ -z "$EMAIL" ] || valid_email "$EMAIL" || die_usage "--email does not look like an e-mail address"
+  [ -z "$VERSION_TAG" ] || valid_tag "$VERSION_TAG" || die_usage "--version must be a release tag like v2.2.0"
+  [ -z "$ACME_DIRECTORY" ] || valid_directory "$ACME_DIRECTORY" || die_usage "--acme-directory must be an https URL"
+  [ -z "$CONFIG" ] || [ -f "$CONFIG" ] || die_usage "--config: there is no file $CONFIG"
+  [ -z "$CONFIG" ] || [ -r "$CONFIG" ] || die_usage "--config: $CONFIG cannot be read"
+  if [ "$MODE" = uninstall ] && [ -n "$CONFIG" ]; then
+    die_usage "--config does not go with --uninstall"
+  fi
+  if [ "$MODE" != uninstall ] && { [ "$YES" -eq 1 ] || [ "$KEEP_DATA" -eq 1 ]; }; then
+    die_usage "--yes and --keep-data go with --uninstall only"
+  fi
 }
 
-# What the previous run chose, so that an update needs no options.  Values are
-# validated again: the file is root's, but it is still input.  The certificate
-# authority is not remembered: --staging is for one test run, and the next
-# plain run returns to Let's Encrypt proper.
-load_previous() {
-  local key value
-  [ -f "$DIR/install.conf" ] || return 0
-  while IFS='=' read -r key value; do
-    case "$key" in
-    ADDRESS) [ -n "$ADDRESS" ] || ! valid_address "$value" || ADDRESS="$value" ;;
-    PORT) [ -n "$PORT" ] || ! valid_port "$value" || PORT="$value" ;;
-    TURN_PORT) [ -n "$TURN_PORT" ] || ! valid_port "$value" || TURN_PORT="$value" ;;
-    ACME_PORT) [ -n "$ACME_PORT" ] || ! valid_port "$value" || ACME_PORT="$value" ;;
-    EMAIL) [ -n "$EMAIL" ] || ! valid_email "$value" || EMAIL="$value" ;;
+# --- the settings file (ADR 0026) ---
+#
+# KEY=value lines, "#" comments, nothing else; read as data, never executed.
+# A setting already chosen by something stronger — an option, or a file read
+# before this one — is kept: the order is the command line, then --config,
+# then the server's own file.  An unknown key or a bad value stops the run
+# with the line named: the file is edited by people and agents, and a typo
+# that is silently ignored would look like a setting that does not work.
+SETTING_NAMES="ADDRESS, PORT, TURN_PORT, ACME_PORT, EMAIL"
+
+read_settings() {
+  local file="$1" line key value number=0 seen=" "
+  [ -f "$file" ] && [ -r "$file" ] ||
+    die "$file is not a file that can be read. Nothing was changed."
+  while IFS= read -r line || [ -n "$line" ]; do
+    number=$((number + 1))
+    line="${line%$'\r'}"
+    # leading and trailing blanks
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    case "$line" in
+    '' | '#'*) continue ;;
     esac
-  done <"$DIR/install.conf"
+    [[ "$line" == *=* ]] ||
+      die "$file, line $number: expected KEY=value, found: $line. Nothing was changed."
+    key="${line%%=*}"
+    value="${line#*=}"
+    key="${key%"${key##*[![:space:]]}"}"
+    value="${value#"${value%%[![:space:]]*}"}"
+    # one line per setting: with two, which one counts would be a guess
+    [[ "$seen" != *" $key "* ]] ||
+      die "$file, line $number: $key is set twice in this file. Nothing was changed."
+    seen="$seen$key "
+    case "$key" in
+    ADDRESS)
+      [ -z "$value" ] || valid_address "$value" ||
+        die "$file, line $number: ADDRESS must be an IPv4 address (203.0.113.5) or a domain name in lower case (chat.example.org). Nothing was changed."
+      [ -n "$ADDRESS" ] || ADDRESS="$value"
+      ;;
+    PORT)
+      [ -z "$value" ] || valid_port "$value" || die "$file, line $number: PORT must be a port number. Nothing was changed."
+      [ -n "$PORT" ] || PORT="$value"
+      ;;
+    TURN_PORT)
+      [ -z "$value" ] || valid_port "$value" || die "$file, line $number: TURN_PORT must be a port number. Nothing was changed."
+      [ -n "$TURN_PORT" ] || TURN_PORT="$value"
+      ;;
+    ACME_PORT)
+      [ -z "$value" ] || valid_port "$value" || die "$file, line $number: ACME_PORT must be a port number. Nothing was changed."
+      [ -n "$ACME_PORT" ] || ACME_PORT="$value"
+      ;;
+    EMAIL)
+      [ -z "$value" ] || valid_email "$value" || die "$file, line $number: EMAIL does not look like an e-mail address. Nothing was changed."
+      # an empty EMAIL in a file is a choice — "no e-mail" — that a weaker
+      # file must not undo
+      if [ -z "$EMAIL" ] && [ "$EMAIL_CHOSEN" -eq 0 ]; then
+        EMAIL="$value"
+        EMAIL_CHOSEN=1
+      fi
+      ;;
+    *)
+      die "$file, line $number: unknown setting $key. The settings are: $SETTING_NAMES. Nothing was changed."
+      ;;
+    esac
+  done <"$file"
 }
+
+# The file of this run (--config), then what the server already has.  The
+# certificate authority is not a setting: --staging is for one test run, and
+# the next plain run returns to Let's Encrypt proper.
+EMAIL_CHOSEN=0
+load_settings() {
+  local path
+  # Something that is not a file where a settings file belongs — a directory
+  # restored in its place — is never stepped over: the run would write the
+  # new file into it and lose the mark that this server is ours.
+  for path in "$CONF" "$OLD_CONF" "$CONF.new"; do
+    [ ! -e "$path" ] && [ ! -L "$path" ] || [ -f "$path" ] ||
+      die "$path is not a regular file; move it away and run this again. Nothing was changed."
+  done
+  [ -z "$EMAIL" ] || EMAIL_CHOSEN=1
+  [ -z "$CONFIG" ] || read_settings "$CONFIG"
+  if [ -f "$CONF" ]; then
+    read_settings "$CONF"
+  elif [ -f "$OLD_CONF" ]; then
+    read_settings "$OLD_CONF"
+  fi
+}
+
+# Is the server in $DIR one that this installer put there?  The developers'
+# deploy tool builds the same layout and leaves no settings file.
+installed_by_us() { [ -f "$CONF" ] || [ -f "$OLD_CONF" ]; }
 
 render_conf() {
-  printf 'ADDRESS=%s\nPORT=%s\nTURN_PORT=%s\nACME_PORT=%s\n' "$ADDRESS" "$PORT" "$TURN_PORT" "$ACME_PORT"
-  [ -z "$EMAIL" ] || printf 'EMAIL=%s\n' "$EMAIL"
+  cat <<CONF
+# Dudescord server settings.
+#
+# To change a setting: edit this file, then run   sudo dudescord apply
+# (it checks the new values first, then restarts the server; accounts stay).
+# Lines are KEY=value.  The guide: $DIR/current/AGENTS.md
+
+# The public address of this machine: its IPv4 address, or a domain name
+# that points to it.  It is in every invite link and in the certificate.
+ADDRESS=$ADDRESS
+
+# The HTTPS port of the site (TCP).  With 443 the address has no port in it.
+PORT=$PORT
+
+# The port of the built-in TURN relay (TCP and UDP), for people whose network
+# blocks direct media.
+TURN_PORT=$TURN_PORT
+
+# Where the certificate proof listens.  Let's Encrypt always connects to
+# port 80; another number here only when a web server of yours owns port 80
+# and forwards /.well-known/acme-challenge/ to 127.0.0.1:<this port>.
+ACME_PORT=$ACME_PORT
+
+# E-mail for Let's Encrypt's notices about the certificate (may stay empty).
+EMAIL=$EMAIL
+CONF
 }
 
 # --- the machine ---
@@ -461,6 +598,12 @@ update)
   shift
   exec bash $DIR/current/install.sh "\$@"
   ;;
+apply)
+  # the settings file, applied by the installed release's own installer:
+  # no download, the same checks, units and restart as an update
+  shift
+  exec bash $DIR/current/install.sh --unpacked $DIR/current "\$@"
+  ;;
 uninstall)
   shift
   exec bash $DIR/current/install.sh --uninstall "\$@"
@@ -474,6 +617,8 @@ WRAPPER
 install_file() {
   local path="$1" mode="$2" body
   body="$(cat)"
+  # `mv` would move the new file INTO a directory of that name and call it done
+  [ ! -d "$path" ] || die "$path is a directory where a file belongs; move it away and run this again."
   if [ -f "$path" ] && [ "$body" = "$(cat "$path")" ]; then
     return 0
   fi
@@ -544,6 +689,55 @@ prune_releases() {
 
 # --- phase 2: install the unpacked release ---
 
+# Everything that can be known before the first change: whose server this
+# is, the settings (options, files, defaults), the address, the ports.  An
+# install starts with it, and --check is nothing else.
+resolve_settings() {
+  # A server put here by the developers' deploy tool is not ours to change.
+  if [ -e "$DIR/current" ] && ! installed_by_us; then
+    die "$DIR holds a Dudescord server that this installer did not install (deployed from the source repository). Nothing was changed."
+  fi
+  load_settings
+  PORT="${PORT:-443}"
+  TURN_PORT="${TURN_PORT:-1194}"
+  ACME_PORT="${ACME_PORT:-80}"
+  if [ -z "$ADDRESS" ]; then
+    step "Finding this machine's public address"
+    ADDRESS="$(detect_address)" ||
+      die "could not find this machine's public IPv4 address. Set it: --address <the address>, or ADDRESS= in the settings file. Nothing was changed."
+    say "$ADDRESS"
+  fi
+  RELAY="$(relay_address "$ADDRESS")" ||
+    die "$ADDRESS does not resolve to an IPv4 address. Create an A record that points to this machine, wait until it is visible, and run this again. Nothing was changed."
+  preflight_ports
+}
+
+# --check: every check of an install, and what it would do.
+check_only() {
+  resolve_settings
+  local url="https://$ADDRESS"
+  [ "$PORT" = 443 ] || url="https://$ADDRESS:$PORT"
+  say ""
+  if [ -e "$DIR/current" ]; then
+    say "Ready: Dudescord is installed here; a run now updates it and applies these settings."
+  else
+    say "Ready: Dudescord is not installed here; a run now installs it."
+  fi
+  say "Nothing was changed."
+  say ""
+  say "  address      $url"
+  say "  ADDRESS      $ADDRESS"
+  say "  PORT         $PORT"
+  say "  TURN_PORT    $TURN_PORT"
+  say "  ACME_PORT    $ACME_PORT"
+  say "  EMAIL        $EMAIL"
+  say "  settings     $CONF"
+  say ""
+  say "These ports must be reachable from the internet (the provider's firewall or"
+  say "security group, if there is one — the installer cannot open that one):"
+  ports_summary
+}
+
 install_release() {
   local release bundle_arch dest ctl
 
@@ -557,23 +751,7 @@ install_release() {
   [ "$bundle_arch" = "$(machine_arch)" ] ||
     die "this bundle is for $bundle_arch and this machine is $(machine_arch)"
 
-  # A server put here by the developers' deploy tool is not ours to change.
-  if [ -e "$DIR/current" ] && [ ! -f "$DIR/install.conf" ]; then
-    die "$DIR holds a Dudescord server that this installer did not install (deployed from the source repository). Nothing was changed."
-  fi
-  load_previous
-  PORT="${PORT:-443}"
-  TURN_PORT="${TURN_PORT:-1194}"
-  ACME_PORT="${ACME_PORT:-80}"
-  if [ -z "$ADDRESS" ]; then
-    step "Finding this machine's public address"
-    ADDRESS="$(detect_address)" ||
-      die "could not find this machine's public IPv4 address. Run again with --address <the address>. Nothing was changed."
-    say "$ADDRESS"
-  fi
-  RELAY="$(relay_address "$ADDRESS")" ||
-    die "$ADDRESS does not resolve to an IPv4 address. Create an A record that points to this machine, wait until it is visible, and run this again. Nothing was changed."
-  preflight_ports
+  resolve_settings
 
   step "Installing release $release to $DIR"
   id -u dudescord >/dev/null 2>&1 ||
@@ -599,7 +777,8 @@ install_release() {
   "$ctl" init --address "$ADDRESS" --port "$PORT"
   "$ctl" admin-config | runuser -u dudescord -- "$ctl" init-data
 
-  render_conf | install_file "$DIR/install.conf" 0600
+  render_conf | install_file "$CONF" 0644
+  rm -f "$OLD_CONF"
   render_unit | install_file "$UNIT_DIR/dudescord.service" 0644
   render_cert_unit | install_file "$UNIT_DIR/dudescord-cert.service" 0644
   render_cert_timer | install_file "$UNIT_DIR/dudescord-cert.timer" 0644
@@ -641,12 +820,20 @@ install_release() {
     say "Dudescord is updated and running."
   fi
   say ""
-  "$ctl" status
+  # the report says so itself when something is not right — a test
+  # certificate of --staging, for one; the install is done either way
+  "$ctl" status || true
   say ""
   say "  dudescord invite            a new invite link"
   say "  dudescord users             who has an account"
+  say "  dudescord owner <name>      make an account the owner: it gets invites and"
+  say "                              accounts in the app's settings (\"Server\")"
   say "  dudescord status            is everything all right"
   say "  dudescord update            install the newest release"
+  say ""
+  say "Settings: $CONF — edit, then: dudescord apply"
+  say "invite, users, owner and status answer in JSON with --json (update and apply"
+  say "print text). The guide for agents: $DIR/current/AGENTS.md"
   say ""
   say "These ports must be reachable from the internet (the provider's firewall or"
   say "security group, if there is one):"
@@ -657,7 +844,7 @@ install_release() {
 
 uninstall() {
   [ "${EUID:-$(id -u)}" -eq 0 ] || die "run this as root"
-  if [ -e "$DIR/current" ] && [ ! -f "$DIR/install.conf" ]; then
+  if [ -e "$DIR/current" ] && ! installed_by_us; then
     die "$DIR holds a Dudescord server that this installer did not install. Nothing was changed."
   fi
   if [ "$KEEP_DATA" -eq 0 ] && [ "$YES" -eq 0 ]; then
@@ -693,6 +880,11 @@ main() {
     return
   fi
   check_machine
+  if [ "$MODE" = check ]; then
+    # the checks need no bundle: nothing is downloaded either
+    check_only
+    return
+  fi
   if [ -z "$UNPACKED" ]; then
     fetch_and_hand_over "$@"
   fi

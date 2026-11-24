@@ -43,6 +43,26 @@ lasts 7 days.
 Open it yourself first, pick a name and a password — you are in the room. Send the same link
 to your friends. The link to the apps is at the bottom of the login page of your server.
 
+Then make yourself the owner, so that invites and accounts are in the app's settings and you
+need the terminal no more: `sudo dudescord owner <your name>`, and reload the page.
+
+### With an AI agent
+
+Give your coding agent (Claude Code, Codex, Cursor, …) access to the machine and this:
+
+> Install a Dudescord server on my VPS, following
+> https://github.com/tapyard/dudescord/blob/main/AGENTS.md. My name in the room will be …
+
+[AGENTS.md](AGENTS.md) is written for agents: the checks, the commands in order, what every
+answer looks like, and what to tell you at the end. Nothing in it needs an answer from a
+person, the server's answers come as JSON with `--json`, and the settings are one file.
+
+### From the desktop app
+
+The app can install the server for you: on its first page choose "Create your own server",
+enter the machine's address and the root password your provider sent, and your name and
+password for the room.
+
 ### Ports
 
 If your provider has a firewall or "security groups" in its control panel, these must be let
@@ -79,6 +99,14 @@ curl -fsSL https://github.com/tapyard/dudescord/releases/latest/download/install
 
 Options are remembered: later runs and updates need none of them.
 
+### Settings
+
+The settings are one file, `/opt/dudescord/dudescord.conf` — the address, the three ports and
+an optional e-mail, each with a comment. To change one, edit the file and run
+`sudo dudescord apply`: it checks the new values, then restarts the server. To see the
+ground before installing, add `--check` to the install command: it runs every check and
+changes nothing.
+
 ## Running it
 
 Everything is one command on the server, as root:
@@ -89,22 +117,33 @@ dudescord invite --days 30
 dudescord invites                 # the live links
 dudescord revoke <link>           # the link stops working; accounts made with it stay
 dudescord users                   # who has an account
+dudescord owner <name>            # makes an account the owner: invites and accounts in the app's settings
+dudescord owner <name> --remove   # …and takes that away
 dudescord reset-password <name>   # prints a new password for someone who forgot theirs
 dudescord remove <name>           # removes an account
 dudescord remove <name> --restart # …and drops everyone connected right now
 dudescord status                  # address, version, certificate, who is connected
+dudescord config                  # the settings file and what is in it
+dudescord apply                   # applies the settings file after an edit
 dudescord update                  # the newest release; accounts and settings stay
 dudescord uninstall               # removes everything (asks first)
 ```
 
-An update restarts the server: everyone drops for a few seconds and reconnects by themselves.
+An update or `apply` restarts the server: everyone drops for a few seconds and reconnects by
+themselves. The commands that answer a question — everything above except `apply`, `update`
+and `uninstall` — take `--json` for scripts and agents.
 
-**The address changed** (a new IP, or you got a domain): `dudescord update --address <new>`.
+**The owner** sees a "Server" section in the app's settings (the gear): new invite links, the
+list of accounts, a new password for someone who forgot theirs, removing an account. There
+can be several owners.
+
+**The address changed** (a new IP, or you got a domain): set `ADDRESS` in the settings file
+and `dudescord apply` (or `dudescord update --address <new>`).
 Accounts stay; people open the new address and log in with the same name and password. Old
 invite links point at the old address — make a new one.
 
-**Backup**: `/opt/dudescord/server.json`, `/opt/dudescord/data/` and `/opt/dudescord/groups/`
-are all there is — accounts, invites, the certificate. The accounts are one file,
+**Backup**: `/opt/dudescord/server.json`, `/opt/dudescord/dudescord.conf`, `/opt/dudescord/data/`
+and `/opt/dudescord/groups/` are all there is — settings, accounts, invites, the certificate. The accounts are one file,
 `/opt/dudescord/groups/main.json`: to move to another machine, install there, copy that file
 over the new one, `chown dudescord:dudescord` it and `systemctl restart dudescord`.
 
