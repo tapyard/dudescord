@@ -39,6 +39,8 @@ UNPACKED=""
 MODE=install
 YES=0
 KEEP_DATA=0
+# The directory phase 1 downloaded into; removed when this process exits.
+DOWNLOAD_DIR=""
 
 say() { printf '%s\n' "$*"; }
 step() { printf '\n==> %s\n' "$*"; }
@@ -103,7 +105,8 @@ valid_port() {
   [[ "$1" =~ ^[1-9][0-9]{0,4}$ ]] && [ "$1" -le 65535 ]
 }
 
-valid_email() { [[ "$1" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+$ ]]; }
+# No "%": the address goes into ExecStart, where systemd expands specifiers.
+valid_email() { [[ "$1" =~ ^[A-Za-z0-9._+-]+@[A-Za-z0-9.-]+$ ]]; }
 
 valid_tag() { [[ "$1" =~ ^v[0-9]+(\.[0-9]+){1,3}(-[0-9A-Za-z.]+)?$ ]]; }
 
@@ -208,6 +211,10 @@ check_machine() {
     command -v "$tool" >/dev/null 2>&1 ||
       die "the command '$tool' is missing; install it with the system's package manager and run this again. Nothing was changed."
   done
+  # `ss` says who listens on a port; without it an update could move a
+  # working server onto a port somebody else holds.
+  command -v ss >/dev/null 2>&1 ||
+    die "the command 'ss' is missing; install the package iproute2 (iproute on some systems) and run this again. Nothing was changed."
   machine_arch >/dev/null
 }
 
@@ -238,20 +245,110 @@ relay_address() {
   say "$resolved"
 }
 
-# Is something listening?  $1: t (TCP) or u (UDP).  Without `ss` the answer is
-# "no": the service or the certificate step will say so themselves.
-port_busy() {
-  command -v ss >/dev/null 2>&1 || return 1
-  [ -n "$(ss -H -l"$1"n "sport = :$2" 2>/dev/null)" ]
+# The main process of the running server, or nothing.
+service_pid() {
+  local pid
+  pid="$(systemctl show -p MainPID --value dudescord.service 2>/dev/null || true)"
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 0
+  say "$pid"
+}
+
+# Does a program other than the running server listen on the port?
+# $1: t (TCP) or u (UDP).  Whose socket it is comes from the socket itself
+# (`ss -p` names the processes), never from what install.conf remembers: after
+# an update that failed half-way the file describes the attempt, not the
+# process.
+#
+# A socket is the server's own only when every process that holds it is the
+# server's main process: a listener without process information, or one that
+# a stranger holds as well (an inherited or passed socket), is somebody
+# else's.  When the question cannot be asked — no `ss`, or it fails — the
+# install stops: "free" is not an answer to a question nobody answered.
+port_taken() {
+  local proto="$1" port="$2" own listing line rest seen
+  own="$(service_pid)"
+  listing="$(ss -H -l"$proto"np "sport = :$port" 2>/dev/null)" ||
+    die "cannot find out who listens on port $port: 'ss -H -l${proto}np' failed. Install the package iproute2, or see why it fails, and run this again. Nothing was changed."
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    [ -n "$own" ] || return 0
+    rest="$line"
+    seen=0
+    while [[ "$rest" =~ pid=([0-9]+) ]]; do
+      [ "${BASH_REMATCH[1]}" = "$own" ] || return 0
+      seen=1
+      rest="${rest#*"${BASH_REMATCH[0]}"}"
+    done
+    [ "$seen" = 1 ] || return 0
+  done <<<"$listing"
+  return 1
+}
+
+# The three TCP ports must differ from each other, and port 80 belongs to the
+# certificate proof alone — Let's Encrypt connects there for every renewal,
+# directly or through the web server that forwards to --acme-port.  The
+# relay's UDP port must stay out of the media range.
+check_ports() {
+  local low="${UDP_RANGE%-*}" high="${UDP_RANGE#*-}"
+  [ "$PORT" != 80 ] ||
+    die "--port 80 cannot work: Let's Encrypt checks the address on port 80 at every renewal. Choose another port. Nothing was changed."
+  [ "$TURN_PORT" != 80 ] ||
+    die "--turn-port 80 cannot work: Let's Encrypt checks the address on port 80 at every renewal. Choose another port. Nothing was changed."
+  [ "$PORT" != "$TURN_PORT" ] ||
+    die "the site (--port) and the TURN relay (--turn-port) cannot share port $PORT. Nothing was changed."
+  [ "$PORT" != "$ACME_PORT" ] ||
+    die "the site (--port) and the certificate proof (--acme-port) cannot share port $PORT. Nothing was changed."
+  [ "$TURN_PORT" != "$ACME_PORT" ] ||
+    die "the TURN relay (--turn-port) and the certificate proof (--acme-port) cannot share port $TURN_PORT. Nothing was changed."
+  if [ "$TURN_PORT" -ge "$low" ] && [ "$TURN_PORT" -le "$high" ]; then
+    die "--turn-port $TURN_PORT is inside the media range (UDP $UDP_RANGE). Choose a port outside it. Nothing was changed."
+  fi
+}
+
+# Nothing else may hold a port this install is about to use: an update that
+# cannot bind leaves a working server down, and nothing is rolled back.
+preflight_ports() {
+  check_ports
+  ! port_taken t "$PORT" ||
+    die "TCP port $PORT is in use by another program. Free it, or choose another port with --port (the address then becomes https://$ADDRESS:<port>). Nothing was changed."
+  if port_taken t "$TURN_PORT" || port_taken u "$TURN_PORT"; then
+    die "port $TURN_PORT is in use by another program. Choose another one for the TURN relay with --turn-port. Nothing was changed."
+  fi
+  if port_taken t "$ACME_PORT"; then
+    if [ "$ACME_PORT" = 80 ]; then
+      die "TCP port 80 is in use by another program, and Let's Encrypt proves the address there. Stop that program, or keep it and make it forward /.well-known/acme-challenge/ to 127.0.0.1:<n>, then run again with --acme-port <n>. Nothing was changed."
+    fi
+    die "TCP port $ACME_PORT (--acme-port) is in use by another program. Nothing was changed."
+  fi
+}
+
+# The download directory is ours to delete only when phase 1 made it: its
+# exact shape (no further slashes, so no "..") and the marker phase 1 left.
+# An --unpacked tree that somebody else prepared is never touched.
+own_download_dir() {
+  [[ "$UNPACKED" =~ ^(/tmp/dudescord-install\.[A-Za-z0-9]{8})/bundle$ ]] || return 0
+  local dir="${BASH_REMATCH[1]}"
+  [ -f "$dir/.dudescord-download" ] && [ ! -L "$dir" ] || return 0
+  DOWNLOAD_DIR="$dir"
+}
+
+remove_download_dir() {
+  [ -z "$DOWNLOAD_DIR" ] || rm -rf "$DOWNLOAD_DIR"
 }
 
 # --- phase 1: fetch the bundle and hand over to its own installer ---
 
 fetch_and_hand_over() {
-  local arch name base tmp
+  local arch name base tmp progress=-sS
   arch="$(machine_arch)"
   name="dudescord-server-linux-$arch.tar.gz"
   tmp="$(mktemp -d /tmp/dudescord-install.XXXXXXXX)"
+  # Until the hand-over a failure removes the download; after it (exec runs
+  # no trap) the bundle's installer owns the directory, known by this marker.
+  DOWNLOAD_DIR="$tmp"
+  trap remove_download_dir EXIT
+  : >"$tmp/.dudescord-download"
+  [ ! -t 2 ] || progress=--progress-bar
   if [ -n "$BUNDLE" ]; then
     [ -f "$BUNDLE" ] || die "--bundle: $BUNDLE is not a file"
     step "Unpacking $BUNDLE"
@@ -263,7 +360,7 @@ fetch_and_hand_over() {
       base="$RELEASES_URL/latest/download"
     fi
     step "Downloading the Dudescord server ($arch)"
-    curl -fL --retry 3 --connect-timeout 20 --progress-bar -o "$tmp/$name" "$base/$name" ||
+    curl -fL --retry 3 --connect-timeout 20 "$progress" -o "$tmp/$name" "$base/$name" ||
       die "could not download $base/$name. Nothing was changed."
     curl -fsSL --retry 3 --connect-timeout 20 -o "$tmp/SHA256SUMS" "$base/SHA256SUMS" ||
       die "could not download $base/SHA256SUMS. Nothing was changed."
@@ -403,14 +500,21 @@ open_firewall() {
     ufw allow "$TURN_PORT/udp" comment dudescord >/dev/null || warn "ufw allow $TURN_PORT/udp failed"
     ufw allow "${UDP_RANGE/-/:}/udp" comment dudescord >/dev/null || warn "ufw allow ${UDP_RANGE/-/:}/udp failed"
   elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+    # Each port goes into the running and the permanent configuration by
+    # itself.  Never `--reload`: it would drop every runtime-only rule of
+    # whatever else lives on this machine.
     step "Opening the ports in firewalld"
     for port in $(firewall_ports_tcp); do
-      firewall-cmd --quiet --permanent --add-port="$port/tcp" || warn "firewall-cmd --add-port=$port/tcp failed"
+      firewalld_open "$port/tcp"
     done
-    firewall-cmd --quiet --permanent --add-port="$TURN_PORT/udp" || warn "firewall-cmd --add-port=$TURN_PORT/udp failed"
-    firewall-cmd --quiet --permanent --add-port="$UDP_RANGE/udp" || warn "firewall-cmd --add-port=$UDP_RANGE/udp failed"
-    firewall-cmd --quiet --reload || warn "firewall-cmd --reload failed"
+    firewalld_open "$TURN_PORT/udp"
+    firewalld_open "$UDP_RANGE/udp"
   fi
+}
+
+firewalld_open() {
+  firewall-cmd --quiet --add-port="$1" || warn "firewall-cmd --add-port=$1 failed"
+  firewall-cmd --quiet --permanent --add-port="$1" || warn "firewall-cmd --permanent --add-port=$1 failed"
 }
 
 ports_summary() {
@@ -441,7 +545,7 @@ prune_releases() {
 # --- phase 2: install the unpacked release ---
 
 install_release() {
-  local release bundle_arch dest ctl service_active=0
+  local release bundle_arch dest ctl
 
   local part
   for part in RELEASE ARCH galene dudescordctl static/index.html; do
@@ -457,8 +561,6 @@ install_release() {
   if [ -e "$DIR/current" ] && [ ! -f "$DIR/install.conf" ]; then
     die "$DIR holds a Dudescord server that this installer did not install (deployed from the source repository). Nothing was changed."
   fi
-  ! systemctl is-active --quiet dudescord.service 2>/dev/null || service_active=1
-
   load_previous
   PORT="${PORT:-443}"
   TURN_PORT="${TURN_PORT:-1194}"
@@ -471,20 +573,7 @@ install_release() {
   fi
   RELAY="$(relay_address "$ADDRESS")" ||
     die "$ADDRESS does not resolve to an IPv4 address. Create an A record that points to this machine, wait until it is visible, and run this again. Nothing was changed."
-
-  if [ "$service_active" -eq 0 ]; then
-    ! port_busy t "$PORT" ||
-      die "TCP port $PORT is in use by another program. Free it, or choose another port with --port (the address then becomes https://$ADDRESS:<port>). Nothing was changed."
-    if port_busy t "$TURN_PORT" || port_busy u "$TURN_PORT"; then
-      die "port $TURN_PORT is in use by another program. Choose another one for the TURN relay with --turn-port. Nothing was changed."
-    fi
-  fi
-  if port_busy t "$ACME_PORT"; then
-    if [ "$ACME_PORT" = 80 ]; then
-      die "TCP port 80 is in use by another program, and Let's Encrypt proves the address there. Stop that program, or keep it and make it forward /.well-known/acme-challenge/ to 127.0.0.1:<n>, then run again with --acme-port <n>. Nothing was changed."
-    fi
-    die "TCP port $ACME_PORT (--acme-port) is in use by another program. Nothing was changed."
-  fi
+  preflight_ports
 
   step "Installing release $release to $DIR"
   id -u dudescord >/dev/null 2>&1 ||
@@ -536,10 +625,6 @@ install_release() {
     die "the server does not answer; its last log lines are above. Earlier releases, if any, are in $DIR/releases."
   fi
   prune_releases
-  # the download directory of phase 1, and nothing else
-  case "$UNPACKED" in
-  /tmp/dudescord-install.*/bundle) rm -rf "$(dirname "$UNPACKED")" ;;
-  esac
 
   # An empty server ends every run with a link to send; a server that has
   # accounts is only reported on.
@@ -612,6 +697,13 @@ main() {
     fetch_and_hand_over "$@"
   fi
   [ -d "$UNPACKED" ] || die "--unpacked: $UNPACKED is not a directory"
+  phase_two
+}
+
+# Whatever happens to the install, the download of phase 1 is removed.
+phase_two() {
+  own_download_dir
+  trap remove_download_dir EXIT
   install_release
 }
 
