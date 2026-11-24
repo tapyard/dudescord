@@ -37,7 +37,7 @@ Dudescord is running. Send this link to your friends: everyone who opens it
 chooses a name and a password. It works for any number of people; a new link
 lasts 7 days.
 
-  https://203.0.113.5/#invite=…
+  https://203.0.113.5:27413/#invite=…
 ```
 
 Open it yourself first, pick a name and a password — you are in the room. Send the same link
@@ -65,15 +65,27 @@ password for the room.
 
 ### Ports
 
+The server does not sit on the usual ports. The installer picks two of the machine's own,
+between 20000 and 31999 — one for the site, one for the relay — so that it does not take
+443 from a web server or 1194 from a VPN you may run, and does not answer on the ports every
+scanner tries first. That is why the address has a port in it. The ports stay the same for
+the life of the server; the installer prints them at the end, and `dudescord status` names
+them any time.
+
 If your provider has a firewall or "security groups" in its control panel, these must be let
 in. (`ufw` and `firewalld` on the machine itself are opened by the installer.)
 
 | Port | For |
 |---|---|
-| TCP 80 | Let's Encrypt checks the address here when it issues or renews the certificate |
-| TCP 443 | the site and the connection of every client |
-| TCP and UDP 1194 | the relay for people whose network blocks direct media |
+| TCP 80 | Let's Encrypt checks the address here when it issues or renews the certificate — nothing listens there the rest of the time, and no other port can do this |
+| TCP, the site's port | the site and the connection of every client |
+| TCP and UDP, the relay's port | the relay for people whose network blocks direct media |
 | UDP 40000–49999 | voice and video |
+
+Want the address without a port? Add `--port 443` to the install command (or set `PORT=443`
+in the settings later). That moves the site only: a call still needs the relay's port and UDP
+40000–49999, so from a network that lets nothing but 443 out people can open the site and
+write, not talk.
 
 ### With a domain name
 
@@ -83,10 +95,11 @@ Point an `A` record at the machine, wait until it resolves, then:
 curl -fsSL https://github.com/tapyard/dudescord/releases/latest/download/install.sh | sudo bash -s -- --address chat.example.org
 ```
 
-### When the ports are taken
+### When port 80 is taken
 
-- Port 443 is busy: `--port 8443` — the address becomes `https://203.0.113.5:8443`.
-- Port 1194 is busy (OpenVPN, say): `--turn-port 3479`.
+The installer skips a port that something holds, so the site's and the relay's ports never
+collide. Port 80 is the one it cannot move:
+
 - Port 80 is busy with your own web server: keep it, make it forward
   `/.well-known/acme-challenge/` to `127.0.0.1:8089`, and add `--acme-port 8089`. For nginx:
 
@@ -167,8 +180,8 @@ Nothing else on the machine is touched. The server runs as its own unprivileged 
 
 - **"no certificate yet"** during the install — Let's Encrypt could not reach port 80. Open TCP
   port 80 in the provider's firewall and run the command again; it continues where it stopped.
-- **People join but do not hear each other** — UDP 40000–49999 or port 1194 is blocked by the
-  provider's firewall.
+- **People join but do not hear each other** — UDP 40000–49999 or the relay's port (TCP and
+  UDP; `turnPort` in `dudescord status --json`) is blocked by the provider's firewall.
 - **The browser says the certificate has expired** — `dudescord status`, then
   `journalctl -u dudescord-cert` shows why the renewal fails (almost always port 80).
 - **Is it running?** — `dudescord status`, `journalctl -u dudescord -n 50`.

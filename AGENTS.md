@@ -13,8 +13,16 @@ room, up to 20 people. The server is one small program ([Galene](https://galene.
 systemd, with a certificate from Let's Encrypt for the machine's bare IP address — no domain
 name is needed. People join from a browser or the desktop app through an invite link.
 
-A finished install is: the service `dudescord` running, `https://<address>` answering with a
-valid certificate, and an invite link in the person's hands.
+A finished install is: the service `dudescord` running, `https://<address>:<port>` answering
+with a valid certificate, and an invite link in the person's hands.
+
+**The server does not use the usual ports.** An install that names none takes two of the
+machine's own between 20000 and 31999 — the site (TCP) and the relay (TCP and UDP) — so that
+it collides with nothing the machine already runs and is not on the ports scanners try first.
+They are the same every time on one machine (`--check` names the ones an install will take)
+and stay for the life of the server. Read them from the installer's last lines or from
+`dudescord status --json` (`port`, `turnPort`); never assume 443. Port 80 is the exception:
+Let's Encrypt can prove an address only there, for a few seconds every few days.
 
 ## Rules
 
@@ -66,25 +74,24 @@ Exit status `0` and `Ready: …` mean that an install will get through its check
 Ready: Dudescord is not installed here; a run now installs it.
 Nothing was changed.
 
-  address      https://203.0.113.5
+  address      https://203.0.113.5:27413
   ADDRESS      203.0.113.5
-  PORT         443
-  TURN_PORT    1194
+  PORT         27413
+  TURN_PORT    21877
   ACME_PORT    80
   EMAIL
   settings     /opt/dudescord/dudescord.conf
 
 These ports must be reachable from the internet (the provider's firewall or
 security group, if there is one — the installer cannot open that one):
-  TCP 80, 443, 1194    UDP 1194, 40000-49999
+  TCP 80, 27413, 21877    UDP 21877, 40000-49999
 ```
 
 Exit status `1` names what is in the way. The usual cases:
 
 | The message says | What to do |
 |---|---|
-| `TCP port 443 is in use by another program` | pick another: `--port 8443` (the address becomes `https://<address>:8443`) |
-| `port 1194 is in use` | `--turn-port 3479` |
+| `TCP port … is in use by another program` (a port that was named with `--port`, `--turn-port` or in the settings) | name another. On a machine with no server yet, naming none also works: the installer then picks a free one. An installed server keeps its port until another is named |
 | `TCP port 80 is in use by another program` | the machine has a web server. Keep it: make it forward `/.well-known/acme-challenge/` to `127.0.0.1:8089` (nginx: `location ^~ /.well-known/acme-challenge/ { proxy_pass http://127.0.0.1:8089; proxy_set_header Host $host; }`), reload it, and add `--acme-port 8089` |
 | `could not find this machine's public IPv4 address` | `--address <the address>` |
 | `… does not resolve to an IPv4 address` | the domain's `A` record is missing or not visible yet |
@@ -102,7 +109,7 @@ Options on the command line are enough for a one-off (`--address`, `--port`, `--
 ```sh
 cat > /root/dudescord.conf <<'EOF'
 ADDRESS=chat.example.org
-PORT=443
+TURN_PORT=3479
 EOF
 ```
 
@@ -132,7 +139,7 @@ dudescord status --json
 ```
 
 ```json
-{"healthy":true,"url":"https://203.0.113.5","address":"203.0.113.5","port":443,"turnPort":1194,"acmePort":80,"version":"2.3.0","commit":"abc1234","service":"active","certificate":{"valid":true,"notAfter":"2026-11-30T23:10:00Z","daysLeft":6.6},"accounts":0,"owners":[],"connected":0,"settingsFile":"/opt/dudescord/dudescord.conf","problems":[]}
+{"healthy":true,"url":"https://203.0.113.5:27413","address":"203.0.113.5","port":27413,"turnPort":21877,"acmePort":80,"version":"2.3.0","commit":"abc1234","service":"active","certificate":{"valid":true,"notAfter":"2026-11-30T23:10:00Z","daysLeft":6.6},"accounts":0,"owners":[],"connected":0,"settingsFile":"/opt/dudescord/dudescord.conf","problems":[]}
 ```
 
 `healthy` is `true` when the service runs, the certificate is one a browser accepts — from a
@@ -153,7 +160,7 @@ dudescord invite --json
 ```
 
 ```json
-{"link":"https://203.0.113.5/#invite=AbCdEfGhIjK","token":"AbCdEfGhIjK","expires":"2026-12-01T10:00:00Z"}
+{"link":"https://203.0.113.5:27413/#invite=AbCdEfGhIjK","token":"AbCdEfGhIjK","expires":"2026-12-01T10:00:00Z"}
 ```
 
 Everyone who opens the link chooses a name and a password. It works for any number of people
@@ -205,15 +212,15 @@ writes it with a comment above every key.
 | Key | Default | Meaning |
 |---|---|---|
 | `ADDRESS` | the machine's public IPv4 address | the address in every invite link and in the certificate: an IPv4 address or a lower-case domain name that points to the machine |
-| `PORT` | `443` | HTTPS port of the site (TCP). Never `80` |
-| `TURN_PORT` | `1194` | the built-in relay, TCP and UDP. Not `80`, not inside 40000–49999 |
+| `PORT` | one of the machine's own, 20000–31999, chosen at the first install | HTTPS port of the site (TCP). Never `80`. `443` gives an address without a port |
+| `TURN_PORT` | another of the machine's own, chosen at the first install | the built-in relay, TCP and UDP. Not `80`, not inside 40000–49999 |
 | `ACME_PORT` | `80` | where the certificate proof listens. Another number only behind a web server that forwards `/.well-known/acme-challenge/` to `127.0.0.1:<this>` |
 | `EMAIL` | empty | e-mail for Let's Encrypt's notices (optional) |
 
 To change a setting:
 
 ```sh
-dudescord config --json          # {"file":"/opt/dudescord/dudescord.conf","settings":{"ADDRESS":"…","PORT":443,…},"apply":"dudescord apply"}
+dudescord config --json          # {"file":"/opt/dudescord/dudescord.conf","settings":{"ADDRESS":"…","PORT":27413,…},"apply":"dudescord apply"}
 # edit the file
 dudescord apply                  # checks the new values first, then rewrites the units and restarts
 ```
@@ -222,6 +229,11 @@ dudescord apply                  # checks the new values first, then rewrites th
 names the line) or a port is taken. It restarts the server: everyone drops for a few seconds
 and reconnects by themselves. After a change of `ADDRESS` or `PORT` old invite links point at
 the old address: make a new one. Accounts stay.
+
+A port is chosen once, for a machine that has no server yet. On an installed server a `PORT`
+or `TURN_PORT` line that is missing or empty means "the port it runs on now", never a new
+one. `turnPort` in the status is `0`, with a problem that says so, only when neither this file
+nor the server's unit names the relay's port.
 
 ## Commands
 

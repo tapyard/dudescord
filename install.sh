@@ -84,8 +84,10 @@ Options:
   --address <ip or name>   the public address of this machine: its IPv4 address
                            or a domain name that points to it
                            (default: the public IPv4 address, detected)
-  --port <n>               HTTPS port (default 443)
-  --turn-port <n>          port of the built-in TURN relay, TCP and UDP (default 1194)
+  --port <n>               HTTPS port of the site (default: a port of this machine's
+                           own between 20000 and 31999; 443 if you want the usual)
+  --turn-port <n>          port of the built-in TURN relay, TCP and UDP
+                           (default: another port of this machine's own)
   --acme-port <n>          where the certificate proof listens (default 80).
                            Let's Encrypt always connects to port 80: give another
                            port only when a web server of yours owns port 80 and
@@ -311,7 +313,8 @@ render_conf() {
 # that points to it.  It is in every invite link and in the certificate.
 ADDRESS=$ADDRESS
 
-# The HTTPS port of the site (TCP).  With 443 the address has no port in it.
+# The HTTPS port of the site (TCP).  The installer chose one of this machine's
+# own; with 443 the address has no port in it.
 PORT=$PORT
 
 # The port of the built-in TURN relay (TCP and UDP), for people whose network
@@ -344,7 +347,7 @@ check_machine() {
     die "run this as root: it creates a system user and writes $DIR and $UNIT_DIR. Nothing was changed."
   [ -d /run/systemd/system ] || die "this machine does not run systemd, which the installer needs. Nothing was changed."
   local tool
-  for tool in curl tar sha256sum runuser useradd install; do
+  for tool in curl tar sha256sum cksum runuser useradd install; do
     command -v "$tool" >/dev/null 2>&1 ||
       die "the command '$tool' is missing; install it with the system's package manager and run this again. Nothing was changed."
   done
@@ -689,6 +692,142 @@ prune_releases() {
 
 # --- phase 2: install the unpacked release ---
 
+# The ports of an install that names none (ADR 0028).  Not 443 and not 1194:
+# those are other programs' ports — a web server's, OpenVPN's — on a machine
+# that may run them, and the first ports every scanner tries.  Each machine
+# gets its own pair between 20000 and 31999 (above the registered services,
+# below the range the kernel hands out for outgoing connections), derived
+# from its machine id: the same every time this is asked on this machine, so
+# that --check names the ports an install will take, and a second run after
+# a failed first one takes the same.  A port that something holds is skipped.
+# What is chosen goes into the settings file and stays for the life of the
+# install; a port named by an option or by the settings file is used as it is.
+PORT_FLOOR=20000
+PORT_SPAN=12000
+
+machine_seed() {
+  local seed=""
+  [ ! -r /etc/machine-id ] || seed="$(head -n 1 /etc/machine-id 2>/dev/null || true)"
+  [ -n "$seed" ] || seed="$(uname -n 2>/dev/null || true)"
+  say "${DUDESCORD_PORT_SEED:-$seed}"
+}
+
+# $1: what the port is for; $2: the attempt.  Prints a port.
+candidate_port() {
+  local sum
+  sum="$(printf '%s:%s:%s' "$(machine_seed)" "$1" "$2" | cksum)"
+  sum="${sum%% *}"
+  say "$((PORT_FLOOR + sum % PORT_SPAN))"
+}
+
+choose_ports() {
+  local attempt candidate
+  if [ -z "$PORT" ]; then
+    for attempt in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19; do
+      candidate="$(candidate_port site "$attempt")"
+      [ "$candidate" != "$TURN_PORT" ] && [ "$candidate" != "$ACME_PORT" ] || continue
+      ! port_taken t "$candidate" || continue
+      PORT="$candidate"
+      break
+    done
+    [ -n "$PORT" ] ||
+      die "could not find a free port for the site between $PORT_FLOOR and $((PORT_FLOOR + PORT_SPAN - 1)). Name one with --port. Nothing was changed."
+  fi
+  if [ -z "$TURN_PORT" ]; then
+    for attempt in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19; do
+      candidate="$(candidate_port turn "$attempt")"
+      [ "$candidate" != "$PORT" ] && [ "$candidate" != "$ACME_PORT" ] || continue
+      ! port_taken t "$candidate" || continue
+      ! port_taken u "$candidate" || continue
+      TURN_PORT="$candidate"
+      break
+    done
+    [ -n "$TURN_PORT" ] ||
+      die "could not find a free port for the TURN relay between $PORT_FLOOR and $((PORT_FLOOR + PORT_SPAN - 1)). Name one with --turn-port. Nothing was changed."
+  fi
+}
+
+# A port of the server that is installed here, from its unit — $1: http or
+# turn.  Prints nothing when it cannot be read.
+applied_port() {
+  local line port
+  line="$(grep -m 1 '^ExecStart=' "$UNIT_DIR/dudescord.service" 2>/dev/null || true)"
+  case "$1" in
+  http) [[ "$line" =~ \ -http\ :([0-9]+)(\ |$) ]] || return 0 ;;
+  turn) [[ "$line" =~ \ -turn\ [^\ ]+:([0-9]+)(\ |$) ]] || return 0 ;;
+  *) return 0 ;;
+  esac
+  # kept aside: valid_port matches a pattern of its own
+  port="${BASH_REMATCH[1]}"
+  ! valid_port "$port" || say "$port"
+}
+
+# A server that is installed keeps its ports through every update: a port
+# that neither an option nor a settings file names is the one it runs on,
+# never a new choice — its address is in people's invite links and in the
+# provider's firewall.  (A file of 2.3.0 or older could leave a port out, and
+# that meant 443 and 1194; the unit says which.)  When the unit does not say,
+# nothing is guessed.
+keep_applied_ports() {
+  [ -f "$UNIT_DIR/dudescord.service" ] && installed_by_us || return 0
+  if [ -z "$PORT" ]; then
+    PORT="$(applied_port http)"
+    [ -n "$PORT" ] ||
+      die "$CONF does not name PORT, and the port this server runs on could not be read from $UNIT_DIR/dudescord.service. Write PORT=<the site's port> to $CONF and run this again. Nothing was changed."
+  fi
+  if [ -z "$TURN_PORT" ]; then
+    TURN_PORT="$(applied_port turn)"
+    [ -n "$TURN_PORT" ] ||
+      die "$CONF does not name TURN_PORT, and the port this server's relay runs on could not be read from $UNIT_DIR/dudescord.service. Write TURN_PORT=<the relay's port> to $CONF and run this again. Nothing was changed."
+  fi
+}
+
+# --keep-data keeps the settings for the next install, and removes the unit —
+# the only place that names a port the settings file leaves out.  Such a port
+# is written into the file first, so that the next install is on the same
+# ports and not on newly chosen ones.
+#
+# The file is never edited in place: the new one is written whole beside it
+# and renamed over it, and a file that cannot be read or written fails the
+# call with the settings as they were.  (Every step is checked by hand: the
+# caller asks "did it work", and bash does not stop at errors inside such a
+# question.)
+remember_applied_ports() {
+  local file key port status new
+  if [ -f "$CONF" ]; then
+    file="$CONF"
+  elif [ -f "$OLD_CONF" ]; then
+    file="$OLD_CONF"
+  else
+    return 0
+  fi
+  new="$file.ports"
+  for key in PORT TURN_PORT; do
+    # 0: the file names it, and that is what the next install reads;
+    # 1: it does not; anything else: the file could not be read
+    status=0
+    grep -Eq "^[[:space:]]*${key}[[:space:]]*=[[:space:]]*[^[:space:]]" "$file" || status=$?
+    [ "$status" -ne 0 ] || continue
+    [ "$status" -eq 1 ] || return 1
+    case "$key" in
+    PORT) port="$(applied_port http)" ;;
+    *) port="$(applied_port turn)" ;;
+    esac
+    [ -n "$port" ] || continue
+    # without the key's empty line, if there is one: a key may be set once
+    # (1 from grep: no other line was left)
+    status=0
+    grep -Ev "^[[:space:]]*${key}[[:space:]]*=[[:space:]]*\$" "$file" >"$new" || status=$?
+    if [ "$status" -gt 1 ] ||
+      ! printf '%s=%s\n' "$key" "$port" >>"$new" ||
+      ! chmod 0644 "$new" ||
+      ! mv "$new" "$file"; then
+      rm -f "$new"
+      return 1
+    fi
+  done
+}
+
 # Everything that can be known before the first change: whose server this
 # is, the settings (options, files, defaults), the address, the ports.  An
 # install starts with it, and --check is nothing else.
@@ -698,9 +837,9 @@ resolve_settings() {
     die "$DIR holds a Dudescord server that this installer did not install (deployed from the source repository). Nothing was changed."
   fi
   load_settings
-  PORT="${PORT:-443}"
-  TURN_PORT="${TURN_PORT:-1194}"
   ACME_PORT="${ACME_PORT:-80}"
+  keep_applied_ports
+  choose_ports
   if [ -z "$ADDRESS" ]; then
     step "Finding this machine's public address"
     ADDRESS="$(detect_address)" ||
@@ -856,6 +995,9 @@ uninstall() {
     else
       die "this removes every account; say so with --yes, or keep them with --keep-data"
     fi
+  fi
+  if [ "$KEEP_DATA" -eq 1 ] && ! remember_applied_ports; then
+    die "could not write the ports this server runs on into its settings file, which --keep-data keeps for the next install. See that the file in $DIR can be read and $DIR written, and run this again. Nothing was changed."
   fi
   systemctl disable --quiet --now dudescord-cert.timer dudescord.service 2>/dev/null || true
   systemctl stop dudescord-cert.service 2>/dev/null || true
